@@ -3,28 +3,63 @@ import { hass, renderIcon } from "../helpers";
 
 const icon_cache = {};
 const list_cache = {};
+const pending = {};
 (window as any).icon_cache = icon_cache;
 
-const getIconQueue = [];
-const _getIcon = async (iconSet: string, iconName: string) => {
+const EMPTY_ICON = { path: "", viewBox: [0, 0, 0, 0] };
+const RETRIES = 3;
+// home-assistant-js-websocket rejects with this code when the connection drops
+const ERR_CONNECTION_LOST = 3;
+
+const _fetchIcon = async (iconSet: string, iconName: string) => {
+  // The icon is requested directly. Previously the full icon list of the set
+  // was downloaded first just to check that the name exists (16k names for
+  // material-symbols) before even the first icon could be shown. The backend
+  // now answers unknown icons with an error, so that check is not needed.
+  for (let attempt = 0; attempt < RETRIES; attempt++) {
+    try {
+      const conn = (await hass()).connection;
+      const icon = await conn.sendMessagePromise({
+        type: "custom_icons/icon",
+        set: iconSet,
+        icon: iconName,
+      });
+      return renderIcon(icon) ?? EMPTY_ICON;
+    } catch (err) {
+      // Error from the backend (unknown icon, broken SVG...) - retrying won't help
+      if (err?.code !== undefined && err.code !== ERR_CONNECTION_LOST)
+        return EMPTY_ICON;
+      // Connection lost (e.g. HA restart, app resumed from background) -
+      // wait for the reconnect and try again
+      await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
+    }
+  }
+  return EMPTY_ICON;
+};
+
+const getIcon = (iconSet: string, iconName: string) => {
   if (iconName.includes("#")) {
     iconName = iconName.split("#")[0];
   }
-  if (!icon_cache[iconSet]?.[iconName]) {
-    const list = await getIconList(iconSet);
-    if (!list.some((i) => i.name == iconName)) {
-      return { path: "", viewBox: [0, 0, 0, 0] };
-    }
-    const conn = (await hass()).connection;
-    const icon = await conn.sendMessagePromise({
-      type: "custom_icons/icon",
-      set: iconSet,
-      icon: iconName,
-    });
+  const cached = icon_cache[iconSet]?.[iconName];
+  if (cached) return Promise.resolve(cached);
 
-    icon_cache[iconSet][iconName] = renderIcon(icon);
+  // Icons used to be fetched through a serial queue: each icon waited for
+  // every icon requested before it (very slow in the icon picker or on slow
+  // devices), and if a single request failed the queue worker crashed and no
+  // more custom icons loaded until the page was reloaded.
+  // Now requests run in parallel, never reject, and elements asking for the
+  // same icon share one request. Failed icons are not cached, so they are
+  // retried the next time they are requested.
+  const key = `${iconSet}:${iconName}`;
+  if (!pending[key]) {
+    pending[key] = _fetchIcon(iconSet, iconName).then((icon) => {
+      if (icon !== EMPTY_ICON) icon_cache[iconSet][iconName] = icon;
+      delete pending[key];
+      return icon;
+    });
   }
-  return icon_cache[iconSet][iconName];
+  return pending[key];
 };
 
 const _preload_cache = async (iconSet: string) => {
@@ -35,42 +70,48 @@ const _preload_cache = async (iconSet: string) => {
   });
 
   for (const icon of icons) {
+    if (!icon) continue; // Older versions could cache null for missing icons
     icon_cache[iconSet][icon.icon] = renderIcon(icon);
   }
 };
 
-const queueWorker = async () => {
-  const work = getIconQueue.shift();
-  if (work !== undefined) {
-    let resolve, iconSet, iconName;
-    [iconSet, iconName, resolve] = work;
-    const icon = await _getIcon(iconSet, iconName);
-    resolve(icon);
-    setTimeout(queueWorker, 1);
-  } else {
-    setTimeout(queueWorker, 50);
-  }
-};
-
-const getIcon = (iconSet: string, iconName: string) => {
-  const promise = new Promise((resolve) =>
-    getIconQueue.push([iconSet, iconName, resolve])
-  );
-
-  return promise;
-};
-
-queueWorker();
-
-const getIconList = async (iconSet: string) => {
+const getIconList = (iconSet: string) => {
   if (!list_cache[iconSet]) {
-    const conn = (await hass()).connection;
-    list_cache[iconSet] = await conn.sendMessagePromise({
-      type: "custom_icons/list",
-      set: iconSet,
-    });
+    list_cache[iconSet] = hass()
+      .then((h) =>
+        h.connection.sendMessagePromise({
+          type: "custom_icons/list",
+          set: iconSet,
+        })
+      )
+      .catch(() => {
+        delete list_cache[iconSet];
+        return [];
+      });
   }
   return list_cache[iconSet];
+};
+
+// The icon sets are only known after a websocket round trip, so ha-icon
+// elements can be rendered before they are registered in window.customIcons
+// (typically on page load or in the companion apps). Home Assistant then marks
+// the element as a legacy icon, renders nothing and never tries again; the
+// _loadIcon patch below only helps elements loaded after it was installed.
+// Once the sets are registered, find those elements and load them again.
+const reloadEarlyIcons = (sets: string[]) => {
+  const visit = (root: Document | ShadowRoot | Element) => {
+    for (const el of root.querySelectorAll("*")) {
+      if (el.localName === "ha-icon") {
+        const icon = (el as any).icon;
+        if (typeof icon === "string" && sets.includes(icon.split(":")[0])) {
+          (el as any)._legacy = false;
+          (el as any)._loadIcon?.();
+        }
+      }
+      if (el.shadowRoot) visit(el.shadowRoot);
+    }
+  };
+  visit(document);
 };
 
 const setup = async () => {
@@ -108,6 +149,10 @@ const setup = async () => {
   add_alias("fa6-regular", "far");
   add_alias("fa6-solid", "fas");
   add_alias("fa6-brands", "fab");
+
+  customElements
+    .whenDefined("ha-icon")
+    .then(() => reloadEarlyIcons([...sets, "fapro", "far", "fas", "fab"]));
 };
 
 const customIconRegistered = setup().catch(() => console.error("Couldn't add custom icons to frontend"));

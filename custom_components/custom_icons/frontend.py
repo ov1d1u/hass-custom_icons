@@ -141,8 +141,18 @@ async def ws_get_icon(
         for collection in collections:
             if prefix in await collection.prefixes(hass):
                 icn = await collection.icon(hass, prefix, icon)
-                icn.update({"prefix": prefix, "icon": icon})
-                icon_cache[prefix][icon] = icn
+                if icn is not None:
+                    icn.update({"prefix": prefix, "icon": icon})
+                    icon_cache[prefix][icon] = icn
+
+    # Previously a missing icon crashed here (None.update) and an unknown set
+    # returned None. Answer with a proper error so the frontend can show an
+    # empty icon right away instead of checking the whole icon list first.
+    if icn is None:
+        connection.send_error(
+            msg["id"], "not_found", f"Icon {prefix}:{icon} not found"
+        )
+        return
 
     connection.send_result(msg["id"], icn)
 
