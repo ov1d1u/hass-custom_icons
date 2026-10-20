@@ -103,7 +103,13 @@ const reloadEarlyIcons = (sets: string[]) => {
     for (const el of root.querySelectorAll("*")) {
       if (el.localName === "ha-icon") {
         const icon = (el as any).icon;
-        if (typeof icon === "string" && sets.includes(icon.split(":")[0])) {
+        // Only the elements Home Assistant gave up on. Others are already
+        // being handled by the _loadIcon patch and must not be loaded twice.
+        if (
+          (el as any)._legacy &&
+          typeof icon === "string" &&
+          sets.includes(icon.split(":")[0])
+        ) {
           (el as any)._legacy = false;
           (el as any)._loadIcon?.();
         }
@@ -169,50 +175,86 @@ interface CustomIcon extends Icon {
 }
 
 // Fullcolor support patch of ha-icon
+//
+// Full-color icons are drawn by adding a <g class="customIcon"> layer inside
+// the <svg> rendered by ha-svg-icon. Previously this layer was added in
+// _setCustomPath and removed by a callback scheduled in _loadIcon, and the two
+// raced: the removal was guarded by `this.icon.format !== "custom_icons"`, but
+// this.icon is a string, so it ran for every icon - including custom ones.
+// When it ran after the layer had been added, the icon stayed blank (sized
+// correctly, but empty) until it was loaded again. A typo
+// (`this.UpdateComplete`) made the ordering even less predictable.
+//
+// Now each ha-icon stores the full-color SVG of the icon it is *currently*
+// showing (_customIconSVG), and a single function makes the layer match it.
+// That function runs whenever the icon arrives and after every render, so it
+// no longer matters in which order things happen.
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+const syncCustomLayer = async (haIcon) => {
+  const svgIcon = haIcon.shadowRoot?.querySelector("ha-svg-icon");
+  if (!svgIcon) return; // Legacy icon or not rendered yet
+  await svgIcon.updateComplete;
+  const root = svgIcon.shadowRoot?.querySelector("svg");
+  if (!root) return;
+
+  const wanted = haIcon._customIconSVG;
+  let layer = root.querySelector(".customIcon");
+  if (!wanted) {
+    layer?.remove();
+    return;
+  }
+  if (!layer) {
+    layer = document.createElementNS(SVG_NS, "g");
+    layer.setAttribute("class", "customIcon");
+    root.appendChild(layer);
+  }
+  if (layer._customIconSVG !== wanted) {
+    layer.innerHTML = wanted;
+    layer._customIconSVG = wanted;
+  }
+};
+
 customElements.whenDefined("ha-icon").then(() => {
   const HaIcon = customElements.get("ha-icon");
+
   const o_setCustomPath = HaIcon.prototype._setCustomPath;
   HaIcon.prototype._setCustomPath = async function (promise, requestedIcon) {
     await o_setCustomPath?.bind(this)?.(promise, requestedIcon);
 
     const icon: CustomIcon = await promise;
+    // Another icon was requested while this one was loading
     if (requestedIcon !== this.icon) return;
 
-    if (!icon.innerSVG || icon.format !== "custom_icons") return;
-
-    await this.UpdateComplete;
-    const el = this.shadowRoot.querySelector("ha-svg-icon");
-    await el?.updateComplete;
-
-    const root = el?.shadowRoot.querySelector("svg");
-    if (root) {
+    if (!icon?.innerSVG || icon.format !== "custom_icons") {
+      this._customIconSVG = undefined;
+    } else {
+      this._customIconSVG = icon.innerSVG;
+      // The layer draws the icon - don't draw the single-color path as well
       this._path = undefined;
       this._secondaryPath = undefined;
-
-      let svg_g = root.querySelector(".customIcon");
-      if (!svg_g) {
-        svg_g = document.createElementNS("http://www.w3.org/2000/svg", "g");
-        svg_g.setAttribute("class", "customIcon");
-        root.appendChild(svg_g);
-      }
-      svg_g.innerHTML = icon.innerSVG;
     }
+    await this.updateComplete;
+    syncCustomLayer(this);
   };
 
   const o_loadIcon = HaIcon.prototype._loadIcon;
   HaIcon.prototype._loadIcon = async function () {
+    // The icon changed: the previous full-color layer no longer applies.
+    // Cleared synchronously, so it can't overwrite the state for the new icon.
+    this._customIconSVG = undefined;
+    syncCustomLayer(this);
+
     await customIconRegistered;
     await o_loadIcon?.call(this);
+  };
 
-    if (this.icon && this.icon.format !== "custom_icons") {
-      this.updateComplete.then(async () => {
-        const el = this.shadowRoot.querySelector("ha-svg-icon");
-        await el?.updateComplete;
-        const root = el?.shadowRoot.querySelector(".customIcon");
-        if (root) {
-          root.remove();
-        }
-      });
-    }
+  // Re-apply the layer after every render. This also covers ha-svg-icon being
+  // replaced, e.g. when an icon rendered as legacy is loaded again.
+  const o_updated = HaIcon.prototype.updated;
+  HaIcon.prototype.updated = function (changedProps) {
+    o_updated?.call(this, changedProps);
+    syncCustomLayer(this);
   };
 });
